@@ -19,7 +19,7 @@ Use this guide for everyday operations.
 - Mongo data: Docker volume `tg-archive_mongodb_data`
 - MinIO data: `<minio-data-dir>`
 
-If you use a network-mounted or otherwise external storage path for MinIO data, make sure it is available before the application stack starts.
+If you use a network-mounted or otherwise external storage path for MinIO data, make sure it is available before the application stack starts. For `sff.local`, the systemd service runs `scripts/sff-wait-for-nas.sh` before `docker compose up -d` so the NAS-backed MinIO path is mounted before MinIO starts.
 
 ### Local development
 
@@ -133,6 +133,16 @@ Check service state:
 sudo systemctl status <systemd-service> --no-pager
 sudo journalctl -u <systemd-service> -n 100 --no-pager
 ```
+
+If your deployment uses a NAS-backed MinIO path and the stack does not start after reboot, check whether the mount hit systemd's start limit before the NAS was reachable. Reset the failed units and restart the stack:
+
+```bash
+sudo systemctl reset-failed home-n-share.mount home-n-share.automount <systemd-service>
+sudo systemctl start home-n-share.automount
+sudo systemctl restart <systemd-service>
+```
+
+The `<systemd-service>` unit should call `scripts/sff-wait-for-nas.sh` in `ExecStartPre` if it depends on `/home/n/share/Backup/tg-archive/minio-data`.
 
 Check containers:
 
