@@ -26,7 +26,17 @@ const {
   IMPORT_BEFORE_LIVE_SYNC,
   BACKFILL_STALE_LOCK_MS,
   DIALOG_AVATAR_DOWNLOAD_TIMEOUT_MS,
+  AUTO_SYNC_NEW_DIALOGS,
 } = process.env;
+
+// Chats and groups that appear after the first dialog sync (you get added, someone
+// new writes) are selected for live sync and fully backfilled without a restart.
+// Broadcast channels and bots stay opt-in. Set AUTO_SYNC_NEW_DIALOGS=false to disable.
+const SHOULD_AUTO_SYNC_NEW_DIALOGS = (AUTO_SYNC_NEW_DIALOGS ?? 'true').toLowerCase() !== 'false';
+const DIALOG_DISCOVERY_INTERVAL_MS = 5 * 60 * 1000;
+const DIALOG_DISCOVERY_DEBOUNCE_MS = 3_000;
+const DIALOG_DISCOVERY_LIMIT = 50;
+const DIALOG_DISCOVERY_TIMEOUT_MS = 60_000;
 
 const SHOULD_IMPORT_BEFORE_LIVE_SYNC = IMPORT_BEFORE_LIVE_SYNC?.toLowerCase() === "true";
 const BOOTSTRAP_EXPORTS_DIR = TELEGRAM_EXPORTS_DIR || "/exports";
@@ -46,6 +56,7 @@ const TELEGRAM_HEALTH_CHECK_INTERVAL_MS = 60_000;
 // previously wedged the whole health check (see ensureTelegramClientHealthy).
 // Must stay below TELEGRAM_HEALTH_CHECK_INTERVAL_MS so ticks don't overlap.
 const TELEGRAM_HEALTH_CHECK_TIMEOUT_MS = 30_000;
+const TELEGRAM_DISCONNECT_TIMEOUT_MS = 5_000;
 const parsedDialogAvatarDownloadTimeoutMs = Number(
   DIALOG_AVATAR_DOWNLOAD_TIMEOUT_MS || DEFAULT_DIALOG_AVATAR_DOWNLOAD_TIMEOUT_MS,
 );
@@ -74,8 +85,11 @@ function checkTelegramConfig({
   }
 }
 
-let tgClient: TelegramClient;
+let tgClient: TelegramClient | undefined;
 let tgClientPromise: Promise<TelegramClient> | undefined;
+let tgConnectingClient: TelegramClient | undefined;
+let tgClientGeneration = 0;
+const telegramClientGenerations = new WeakMap<TelegramClient, number>();
 let messageHistoryIndexesReady: Promise<void> | null = null;
 let dialogIndexesReady: Promise<void> | null = null;
 const liveEventHandlersBoundClients = new WeakSet<TelegramClient>();
@@ -89,7 +103,18 @@ function attachLiveEventHandlers(client: TelegramClient) {
   client.addEventHandler(handleReactionUpdateEvent, new Raw({ types: [Api.UpdateMessageReactions] }));
   client.addEventHandler(handleEditedMessageEvent, new Raw({ types: [Api.UpdateEditMessage, Api.UpdateEditChannelMessage] }));
   client.addEventHandler(handleDeletedMessageEvent, new Raw({ types: [Api.UpdateDeleteMessages, Api.UpdateDeleteChannelMessages] }));
+  client.addEventHandler(handleMembershipUpdateEvent, new Raw({
+    types: [Api.UpdateChannel, Api.UpdateChatParticipants, Api.UpdateNewMessage, Api.UpdateNewChannelMessage],
+  }));
   liveEventHandlersBoundClients.add(client);
+}
+
+function detachLiveEventHandlers(client: TelegramClient) {
+  client.removeEventHandler(handleNewMessageEvent);
+  client.removeEventHandler(handleReactionUpdateEvent);
+  client.removeEventHandler(handleEditedMessageEvent);
+  client.removeEventHandler(handleDeletedMessageEvent);
+  client.removeEventHandler(handleMembershipUpdateEvent);
 }
 
 async function disconnectTelegramClient(client: TelegramClient | undefined, reason: string) {
@@ -98,19 +123,40 @@ async function disconnectTelegramClient(client: TelegramClient | undefined, reas
   }
 
   try {
+    detachLiveEventHandlers(client);
     console.warn(`Disconnecting Telegram client: ${reason}`);
-    await client.disconnect();
+    await withTimeout(
+      client.disconnect(),
+      TELEGRAM_DISCONNECT_TIMEOUT_MS,
+      `disconnecting Telegram client (${reason})`,
+    );
   } catch (error) {
     console.error(`Error disconnecting Telegram client (${reason}):`, error);
   }
 }
 
-async function resetTelegramClient(reason: string, client: TelegramClient | undefined = tgClient) {
-  if (client && tgClient === client) {
-    tgClient = undefined;
+async function resetTelegramClient(
+  reason: string,
+  client: TelegramClient | undefined = tgClient,
+  expectedGeneration?: number,
+) {
+  if (expectedGeneration !== undefined && expectedGeneration !== tgClientGeneration) {
+    return false;
   }
 
-  await disconnectTelegramClient(client, reason);
+  const resetGeneration = ++tgClientGeneration;
+
+  const clients = new Set<TelegramClient>();
+  if (client) clients.add(client);
+  if (tgClient) clients.add(tgClient);
+  if (tgConnectingClient) clients.add(tgConnectingClient);
+
+  tgClient = undefined;
+  tgConnectingClient = undefined;
+  tgClientPromise = undefined;
+
+  await Promise.all(Array.from(clients, (candidate) => disconnectTelegramClient(candidate, reason)));
+  return tgClientGeneration === resetGeneration;
 }
 
 async function getTelegramClient() {
@@ -122,10 +168,13 @@ async function getTelegramClient() {
     return tgClientPromise;
   }
 
-  tgClientPromise = (async () => {
-    if (tgClient && !tgClient.connected) {
-      await resetTelegramClient('stale disconnected client before reconnect', tgClient);
-    }
+  if (tgClient && !tgClient.connected) {
+    await resetTelegramClient('stale disconnected client before reconnect', tgClient);
+    return getTelegramClient();
+  }
+
+  const generation = ++tgClientGeneration;
+  const connectionPromise = (async () => {
 
   const apiId = Number(TELEGRAM_API_ID);
   const apiHash = TELEGRAM_API_HASH || "";
@@ -159,8 +208,21 @@ async function getTelegramClient() {
         langCode: "en",
       }
     );
+    telegramClientGenerations.set(client, generation);
 
-    await client.connect();
+    if (generation !== tgClientGeneration) {
+      throw new Error('Telegram connection attempt was superseded');
+    }
+    tgConnectingClient = client;
+    await withTimeout(
+      client.connect(),
+      TELEGRAM_HEALTH_CHECK_TIMEOUT_MS,
+      'connecting to Telegram',
+    );
+
+    if (generation !== tgClientGeneration) {
+      throw new Error('Telegram connection attempt was superseded');
+    }
     
     if (!await client.checkAuthorization()) {
       await setAgentStatus("needs_auth", {
@@ -240,6 +302,10 @@ async function getTelegramClient() {
       }
     }
 
+    if (generation !== tgClientGeneration) {
+      throw new Error('Telegram connection attempt was superseded');
+    }
+
     console.log("Successfully connected to Telegram.");
     await setAgentStatus("authenticated", {
       message: "Telegram authenticated",
@@ -252,6 +318,10 @@ async function getTelegramClient() {
       console.log("Telegram session created and stored locally. Copy it from your persisted environment only if you explicitly need it.");
     }
 
+    if (generation !== tgClientGeneration) {
+      throw new Error('Telegram connection attempt was superseded');
+    }
+    attachLiveEventHandlers(client);
     tgClient = client;
     return tgClient;
 
@@ -259,15 +329,25 @@ async function getTelegramClient() {
     console.error("Error connecting to Telegram:", error);
 
     await disconnectTelegramClient(client, 'connection failure during setup');
-    await resetTelegramClient('connection failure');
 
-    throw error;
+    const connectionError = error instanceof Error ? error : new Error(String(error));
+    Object.assign(connectionError, { telegramClientGeneration: generation });
+    throw connectionError;
   } finally {
-    tgClientPromise = undefined;
+    if (tgConnectingClient === client) {
+      tgConnectingClient = undefined;
+    }
   }
   })();
 
-  return tgClientPromise;
+  tgClientPromise = connectionPromise;
+  try {
+    return await connectionPromise;
+  } finally {
+    if (tgClientPromise === connectionPromise) {
+      tgClientPromise = undefined;
+    }
+  }
 }
 
 let dbClient: Db;
@@ -289,6 +369,12 @@ type DialogContextSnapshot = {
 
 const dialogContextCache = new Map<string, DialogContextSnapshot>();
 const liveDiscoveredDialogIds = new Set<string>();
+let dialogDiscoveryTimer: ReturnType<typeof setInterval> | undefined;
+let dialogDiscoveryDebounceTimer: ReturnType<typeof setTimeout> | undefined;
+let dialogDiscoveryInFlight = false;
+// Decided once at startup: on a fresh install (no dialogs yet) nothing is auto-selected,
+// the first sync is the user's to choose.
+let archiveHadDialogsAtStartup = false;
 
 async function getMongoDbClient() {
   if (dbClient) {
@@ -367,6 +453,167 @@ async function getLiveSyncChatIds(forceRefresh = false): Promise<Set<string>> {
 async function isLiveSyncEnabled(chatId: string | number | bigint): Promise<boolean> {
   const chatIds = await getLiveSyncChatIds();
   return chatIds.has(chatId.toString());
+}
+
+type NewDialogKind = {
+  isUser?: boolean;
+  isGroup?: boolean;
+  bot?: boolean;
+  deleted?: boolean;
+};
+
+function shouldAutoSyncNewDialog(kind: NewDialogKind): boolean {
+  if (!SHOULD_AUTO_SYNC_NEW_DIALOGS || !archiveHadDialogsAtStartup) {
+    return false;
+  }
+  if (kind.isGroup) {
+    return true;
+  }
+  return Boolean(kind.isUser) && !kind.bot && !kind.deleted;
+}
+
+// Selects a newly discovered dialog for live sync and queues a full backfill for it,
+// the same request the admin makes when a chat is ticked by hand.
+async function enableLiveSyncForNewDialog(tgDialogId: TelegramDialogId, reason: string) {
+  try {
+    const db = await getMongoDbClient();
+    const now = new Date();
+    const result = await db.collection<LiveSyncConfigDocument>('syncConfig').updateOne(
+      { _id: LIVE_SYNC_CONFIG_ID },
+      { $addToSet: { liveSyncChatIds: tgDialogId }, $set: { updatedAt: now } },
+      { upsert: true },
+    );
+    // Make the very message that revealed the chat count, without waiting for the cache TTL.
+    liveSyncChatIdsCache.add(tgDialogId);
+
+    if ((result.modifiedCount || 0) === 0 && (result.upsertedCount || 0) === 0) {
+      return;
+    }
+
+    await db.collection<DialogSyncStatus>('dialogSync').updateOne(
+      { tgDialogId },
+      {
+        $set: {
+          forceBackfillRequestedAt: now,
+          forceBackfillMode: 'full',
+          backfillUpdatedAt: now,
+          lastSyncDate: now,
+        },
+        $unset: {
+          forceBackfillAfterDate: '',
+          forceBackfillWindowDays: '',
+        },
+      } as any,
+      { upsert: true },
+    );
+    console.log(`Auto-enabled live sync for new dialog ${tgDialogId} (${reason}); full backfill queued.`);
+  } catch (error) {
+    console.error(`Failed to auto-enable live sync for ${tgDialogId}:`, error);
+  }
+}
+
+// Looks at the newest dialogs and archives any the DB has never seen. Runs on a timer and
+// shortly after membership-like updates, so being added to a chat doesn't need a restart.
+async function discoverNewDialogs(trigger: string) {
+  if (isShuttingDown || dialogDiscoveryInFlight) {
+    return;
+  }
+
+  dialogDiscoveryInFlight = true;
+  try {
+    const client = await getTelegramClient();
+    const dialogs = await withTimeout(
+      client.getDialogs({ limit: DIALOG_DISCOVERY_LIMIT }),
+      DIALOG_DISCOVERY_TIMEOUT_MS,
+      `listing recent dialogs (${trigger})`,
+    );
+
+    const ids = dialogs
+      .filter((dialog) => dialog.id !== undefined && dialog.id !== null)
+      .map((dialog) => createTelegramDialogId(dialog.id!.toString()));
+    if (ids.length === 0) {
+      return;
+    }
+
+    const db = await getMongoDbClient();
+    const known = await db.collection<DialogDocument>('dialogs').find(
+      { tgDialogId: { $in: ids } },
+      { projection: { _id: 0, tgDialogId: 1 } },
+    ).toArray();
+    const knownIds = new Set(known.map((row) => String(row.tgDialogId)));
+
+    for (const dialog of dialogs) {
+      if (isShuttingDown || dialog.id === undefined || dialog.id === null) {
+        continue;
+      }
+      const tgDialogId = createTelegramDialogId(dialog.id.toString());
+      if (knownIds.has(tgDialogId)) {
+        continue;
+      }
+
+      try {
+        console.log(`Discovered new dialog (${trigger}): ${tgDialogId} ${dialog.title || ''}`.trim());
+        const created = await saveDialog(dialog);
+        if (created && shouldAutoSyncNewDialog(describeDialogKind(dialog))) {
+          await enableLiveSyncForNewDialog(tgDialogId, `discovery:${trigger}`);
+        }
+      } catch (error) {
+        console.error(`Failed to archive newly discovered dialog ${tgDialogId}:`, error);
+      }
+    }
+  } catch (error) {
+    console.error(`Dialog discovery failed (${trigger}):`, error);
+  } finally {
+    dialogDiscoveryInFlight = false;
+  }
+}
+
+function scheduleDialogDiscovery(trigger: string) {
+  if (isShuttingDown) {
+    return;
+  }
+  if (dialogDiscoveryDebounceTimer) {
+    clearTimeout(dialogDiscoveryDebounceTimer);
+  }
+  dialogDiscoveryDebounceTimer = setTimeout(() => {
+    dialogDiscoveryDebounceTimer = undefined;
+    discoverNewDialogs(trigger).catch((error) => {
+      console.error('Unexpected dialog discovery failure:', error);
+    });
+  }, DIALOG_DISCOVERY_DEBOUNCE_MS);
+}
+
+function startDialogDiscovery() {
+  if (dialogDiscoveryTimer) {
+    return;
+  }
+
+  dialogDiscoveryTimer = setInterval(() => {
+    discoverNewDialogs('interval').catch((error) => {
+      console.error('Unexpected dialog discovery failure:', error);
+    });
+  }, DIALOG_DISCOVERY_INTERVAL_MS);
+}
+
+function describeDialogKind(dialog: Dialog): NewDialogKind {
+  const entity = dialog.entity as any;
+  return {
+    isUser: dialog.isUser,
+    isGroup: dialog.isGroup,
+    bot: Boolean(entity?.bot),
+    deleted: Boolean(entity?.deleted),
+  };
+}
+
+// Joining, being added, a group being created or upgraded: these arrive as service
+// messages (which NewMessage skips) or as bare channel/participant updates.
+async function handleMembershipUpdateEvent(update: Api.TypeUpdate) {
+  if (update instanceof Api.UpdateNewMessage || update instanceof Api.UpdateNewChannelMessage) {
+    if (!(update.message instanceof Api.MessageService)) {
+      return;
+    }
+  }
+  scheduleDialogDiscovery(update.className);
 }
 
 function parseDateValue(value: unknown): Date | undefined {
@@ -762,8 +1009,11 @@ async function processAllDialogs(client: TelegramClient) {
         qrDataUrl: null,
       });
 
-      await saveDialog(dialog);
-      
+      const created = await saveDialog(dialog);
+      if (created && shouldAutoSyncNewDialog(describeDialogKind(dialog))) {
+        await enableLiveSyncForNewDialog(createTelegramDialogId(dialog.id!.toString()), 'startup dialog sync');
+      }
+
       // Optional: Add some delay to avoid rate limits
       await new Promise(resolve => setTimeout(resolve, 500));
       
@@ -1260,12 +1510,9 @@ async function ensureTelegramClientHealthy(trigger: string) {
   }
 
   telegramHealthCheckInFlight = true;
+  let client: TelegramClient | undefined;
   try {
-    const client = await withTimeout(
-      getTelegramClient(),
-      TELEGRAM_HEALTH_CHECK_TIMEOUT_MS,
-      `acquiring Telegram client for health check (${trigger})`,
-    );
+    client = await getTelegramClient();
     attachLiveEventHandlers(client);
     await withTimeout(
       client.invoke(new Api.updates.GetState()),
@@ -1275,6 +1522,29 @@ async function ensureTelegramClientHealthy(trigger: string) {
   } catch (error) {
     console.error(`Telegram health check failed (${trigger}):`, error);
 
+    if (isShuttingDown) {
+      return;
+    }
+
+    const errorGeneration = error instanceof Error
+      ? (error as Error & { telegramClientGeneration?: number }).telegramClientGeneration
+      : undefined;
+    const failedGeneration = client
+      ? telegramClientGenerations.get(client)
+      : errorGeneration;
+    if (failedGeneration === undefined || failedGeneration !== tgClientGeneration) {
+      return;
+    }
+
+    const reset = await resetTelegramClient(
+      `health check failure (${trigger})`,
+      client,
+      failedGeneration,
+    );
+    if (!reset) {
+      return;
+    }
+
     await setAgentStatus('error', {
       message: error instanceof Error
         ? `Telegram reconnecting after health check failure: ${error.message}`
@@ -1282,14 +1552,12 @@ async function ensureTelegramClientHealthy(trigger: string) {
       qrDataUrl: null,
     });
 
-    await resetTelegramClient(`health check failure (${trigger})`);
-
     try {
-      const recoveredClient = await withTimeout(
-        getTelegramClient(),
-        TELEGRAM_HEALTH_CHECK_TIMEOUT_MS,
-        `reconnecting Telegram client after ${trigger}`,
-      );
+      const recoveredClient = await getTelegramClient();
+      const recoveredGeneration = telegramClientGenerations.get(recoveredClient);
+      if (isShuttingDown || recoveredGeneration !== tgClientGeneration) {
+        return;
+      }
       attachLiveEventHandlers(recoveredClient);
       await setAgentStatus('listening', {
         message: 'Listening for new messages',
@@ -1298,6 +1566,18 @@ async function ensureTelegramClientHealthy(trigger: string) {
       console.log(`Telegram client recovered after ${trigger}.`);
     } catch (recoveryError) {
       console.error(`Telegram client recovery failed (${trigger}):`, recoveryError);
+      if (!isShuttingDown) {
+        const recoveryGeneration = recoveryError instanceof Error
+          ? (recoveryError as Error & { telegramClientGeneration?: number }).telegramClientGeneration
+          : undefined;
+        if (recoveryGeneration !== undefined) {
+          await resetTelegramClient(
+            `recovery failure (${trigger})`,
+            undefined,
+            recoveryGeneration,
+          );
+        }
+      }
     }
   } finally {
     telegramHealthCheckInFlight = false;
@@ -1327,6 +1607,9 @@ async function main() {
     // index before anything starts writing dialog documents.
     await ensureDialogIndexes();
 
+    const db = await getMongoDbClient();
+    archiveHadDialogsAtStartup = (await db.collection('dialogs').estimatedDocumentCount()) > 0;
+
     // Phase 1: Optional backup bootstrap import
     console.log('Phase 1: Checking backup bootstrap import...');
     await runBackupBootstrapIfNeeded();
@@ -1343,11 +1626,15 @@ async function main() {
     });
     startDialogBackfillRequestPolling();
     startTelegramHealthChecks();
+    startDialogDiscovery();
 
     console.log('Phase 3: Scheduling startup dialog sync and historical backfill...');
     void runStartupSyncInBackground(client);
 
   } catch (error) {
+    if (isShuttingDown) {
+      return;
+    }
     await setAgentStatus("error", {
       message: error instanceof Error ? error.message : "Unknown fatal error",
     });
@@ -1399,11 +1686,19 @@ async function gracefulShutdown(signal: string) {
     telegramHealthCheckTimer = undefined;
   }
 
+  if (dialogDiscoveryTimer) {
+    clearInterval(dialogDiscoveryTimer);
+    dialogDiscoveryTimer = undefined;
+  }
+
+  if (dialogDiscoveryDebounceTimer) {
+    clearTimeout(dialogDiscoveryDebounceTimer);
+    dialogDiscoveryDebounceTimer = undefined;
+  }
+
   await releaseDialogSyncLocks();
 
-  if (tgClient) {
-    await resetTelegramClient(`shutdown (${signal})`, tgClient);
-  }
+  await resetTelegramClient(`shutdown (${signal})`, tgClient);
 
   if (mongoClientConnection) {
     try {
@@ -1562,16 +1857,17 @@ function isValidTelegramDialogId(id: any): id is TelegramDialogId {
 
 // in agent/index.ts
 
-async function saveDialog(dialog: Dialog) {
+// Returns true when this created the dialog's document (first time it's seen).
+async function saveDialog(dialog: Dialog): Promise<boolean> {
   if (!dialog.id) {
     console.error("Dialog id is missing");
-    return;
+    return false;
   }
 
   const tgDialogId = createTelegramDialogId(dialog.id);
   if (!isValidTelegramDialogId(tgDialogId)) {
     console.error(`Invalid dialog id: ${tgDialogId}`);
-    return;
+    return false;
   }
 
   // Download and store avatar
@@ -1690,6 +1986,7 @@ async function saveDialog(dialog: Dialog) {
     } else {
       console.log(`No real changes detected for dialog ${tgDialogId}`);
     }
+    return false;
   } else {
     // First time seeing this dialog
     const timestamp = new Date();
@@ -1709,14 +2006,15 @@ async function saveDialog(dialog: Dialog) {
     // Upsert (not insert) so a concurrent live-sync/backfill pass that already
     // created this dialog cannot produce a duplicate document.
     try {
-      await dialogsCollection.replaceOne({ tgDialogId }, initialDialog, { upsert: true });
+      const result = await dialogsCollection.replaceOne({ tgDialogId }, initialDialog, { upsert: true });
       console.log(`Created new dialog with id: ${tgDialogId}`);
+      return (result.upsertedCount || 0) > 0;
     } catch (error: any) {
       if (error?.code === 11000) {
         console.warn(`Dialog ${tgDialogId} was created concurrently; skipping duplicate insert.`);
-      } else {
-        throw error;
+        return false;
       }
+      throw error;
     }
   }
 }
@@ -2367,6 +2665,9 @@ async function ensureDialogExistsForLiveMessage(message: Api.Message) {
 
   if ((upsertResult.upsertedCount || 0) > 0) {
     console.log(`Discovered new dialog from live message: ${seed.tgDialogId}`);
+    if (shouldAutoSyncNewDialog({ ...seed, bot: seed.entity.bot, deleted: seed.entity.deleted })) {
+      await enableLiveSyncForNewDialog(seed.tgDialogId, 'live message');
+    }
   }
 
   if ((upsertResult.matchedCount || 0) > 0 || (upsertResult.upsertedCount || 0) > 0) {
