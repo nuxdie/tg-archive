@@ -3,6 +3,7 @@ import { createHmac, randomBytes, timingSafeEqual } from 'crypto';
 import express from 'express';
 import { Db, MongoClient } from 'mongodb';
 import { existsSync } from 'fs';
+import { pipeline } from 'stream';
 import { join } from 'path';
 import { ROUTES } from './shared/api';
 import 'dotenv/config';
@@ -355,16 +356,29 @@ if (existsSync(webDistPath)) {
 
 let mongoClient: MongoClient | undefined;
 let mongoDb: Db | undefined;
+let mongoConnecting: Promise<Db> | undefined;
 
 async function getMongoDbClient() {
     if (mongoDb) {
         return mongoDb;
     }
 
-    mongoClient = new MongoClient(process.env.MONGO_URI || "");
-    await mongoClient.connect();
-    mongoDb = mongoClient.db("tgArchive");
-    return mongoDb;
+    // The SPA fires several API calls at once on first load; share one connect
+    // so concurrent callers don't each open a client (and a pool) that is then
+    // orphaned when the last one wins the assignment.
+    if (!mongoConnecting) {
+        mongoConnecting = (async () => {
+            const client = new MongoClient(process.env.MONGO_URI || "");
+            await client.connect();
+            mongoClient = client;
+            mongoDb = client.db("tgArchive");
+            return mongoDb;
+        })().catch((error) => {
+            mongoConnecting = undefined;
+            throw error;
+        });
+    }
+    return mongoConnecting;
 }
 
 async function closeMongoDbClient() {
@@ -1639,17 +1653,12 @@ app.get(ROUTES.web.messageHistory, async (req, res) => {
 });
 
 app.get('/media/:key', async (req, res) => {
+    const bucket = process.env.MINIO_BUCKET_NAME || 'tg-archive';
+    let stream: NodeJS.ReadableStream | undefined;
     try {
-        const stream = await minioClient.getObject(
-            process.env.MINIO_BUCKET_NAME || 'tg-archive',
-            req.params.key
-        );
-
-        // Get object info to set correct content type
-        const stat = await minioClient.statObject(
-            process.env.MINIO_BUCKET_NAME || 'tg-archive',
-            req.params.key
-        );
+        // Stat before opening the object stream: a missing key fails here,
+        // with nothing open that would need tearing down.
+        const stat = await minioClient.statObject(bucket, req.params.key);
 
         const requestedFileName = typeof req.query.filename === 'string' ? req.query.filename.trim() : undefined;
         const encodedFileName = stat.metaData['original-filename'];
@@ -1671,13 +1680,36 @@ app.get('/media/:key', async (req, res) => {
         const downloadName = requestedFileName || originalFileName || req.params.key;
         const encodedDownloadName = encodeURIComponent(downloadName);
 
+        stream = await minioClient.getObject(bucket, req.params.key);
+
         res.setHeader('Content-Type', contentType);
+        res.setHeader('Content-Length', String(stat.size));
         res.setHeader('Content-Disposition', `inline; filename*=UTF-8''${encodedDownloadName}`);
         res.setHeader('Cache-Control', 'public, max-age=31536000'); // Cache for 1 year
-        stream.pipe(res);
+
+        // pipeline, not pipe: when the browser abandons a download (scrolling
+        // past a photo, cancelling a video) pipe left the MinIO stream open with
+        // its buffer, and the admin grew by a few hundred KB per abort until it
+        // was swapping at 3 GB (2026-10-22). pipeline destroys both ends on a
+        // premature close; the explicit close handler covers runtimes where the
+        // response's close doesn't propagate.
+        const source = stream;
+        res.on('close', () => {
+            (source as any).destroy?.();
+        });
+        pipeline(source, res, (error) => {
+            if (error && (error as NodeJS.ErrnoException).code !== 'ERR_STREAM_PREMATURE_CLOSE') {
+                console.error('Error streaming media:', error);
+            }
+        });
     } catch (error) {
+        (stream as any)?.destroy?.();
         console.error('Error serving media:', error);
-        res.status(404).send('Media not found');
+        if (!res.headersSent) {
+            res.status(404).send('Media not found');
+        } else {
+            res.end();
+        }
     }
 });
 
